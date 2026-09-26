@@ -1,0 +1,105 @@
+name: Markdown Guard
+
+# Detects silent large-content-loss in Markdown files (net-negative deleted lines
+# beyond a threshold), which is the exact failure mode that caused a 3-day outage
+# from a silent large-diff markdown merge. This is a deterministic, non-AI safety
+# net that complements Copilot code review's markdown-review.instructions.md.
+
+on:
+  pull_request:
+    paths:
+      - '**.md'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  markdown-diff-guard:
+    name: Check markdown diff for large net deletions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out PR head commit with full history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Detect changed markdown files
+        id: changed-files
+        uses: tj-actions/changed-files@v45
+        with:
+          files: |
+            **.md
+
+      - name: Check net line delta against merge-base for changed markdown files
+        id: diff-check
+        if: steps.changed-files.outputs.any_changed == 'true'
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+          # Net-negative deleted lines allowed before a single markdown file is
+          # flagged. Start conservative; tune per repo as false-positive rate is
+          # observed.
+          THRESHOLD: -50
+          BASE_REF: ${{ github.event.pull_request.base.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          merge_base="$(git merge-base "$BASE_REF" "$HEAD_REF")"
+          echo "Merge base: $merge_base"
+
+          flagged=0
+          {
+            echo "## Markdown Guard — net line delta report"
+            echo ""
+            echo "| File | Added | Deleted | Net |"
+            echo "|------|-------|---------|-----|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for file in $CHANGED_FILES; do
+            if [ ! -f "$file" ]; then
+              # File was deleted entirely in this PR — treat as a full-file removal.
+              continue
+            fi
+
+            stat_line="$(git diff --numstat "$merge_base" "$HEAD_REF" -- "$file" || true)"
+            if [ -z "$stat_line" ]; then
+              continue
+            fi
+
+            added="$(echo "$stat_line" | awk '{print $1}')"
+            deleted="$(echo "$stat_line" | awk '{print $2}')"
+
+            # Binary files report as "-"; skip those (not applicable to markdown).
+            if [ "$added" = "-" ] || [ "$deleted" = "-" ]; then
+              continue
+            fi
+
+            net=$((added - deleted))
+            echo "| $file | $added | $deleted | $net |" >> "$GITHUB_STEP_SUMMARY"
+
+            if [ "$net" -le "$THRESHOLD" ]; then
+              echo "::warning file=$file::Net line delta $net exceeds threshold ($THRESHOLD) — possible silent large-content-loss."
+              flagged=1
+            fi
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$flagged" -eq 1 ]; then
+            echo "**Result:** One or more markdown files exceeded the net-deletion threshold ($THRESHOLD lines). Review carefully before merging." >> "$GITHUB_STEP_SUMMARY"
+            echo "flagged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "**Result:** No markdown file exceeded the net-deletion threshold ($THRESHOLD lines)." >> "$GITHUB_STEP_SUMMARY"
+            echo "flagged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: No markdown files changed
+        if: steps.changed-files.outputs.any_changed != 'true'
+        run: echo "No markdown files changed in this PR — skipping diff check." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if a markdown file exceeded the net-deletion threshold
+        if: steps.diff-check.outputs.flagged == 'true'
+        run: |
+          echo "Markdown guard: one or more files exceeded the net-deletion threshold. See job summary for details."
+          exit 1
